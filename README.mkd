@@ -1,0 +1,108 @@
+# pylonforce2mqtt
+
+Exposes a Pylontech Force H2 battery to MQTT following the [Homie 5
+convention](https://homieiot.github.io/). Talks to the battery's BMS over Modbus
+RTU over TCP (such as what's exposed by the logger built into the BMS).
+
+See [REGISTERS.md](REGISTERS.md) for the register map.
+
+## Usage
+
+```
+pylonforce2mqtt mqtt --tcp gateway.local:502 --mqtt-broker mqtt://broker:1883?client_id=pylonforce
+```
+
+Nothing is ever written to the battery, and nothing is subscribed to on MQTT: all of the properties
+are read-only.
+
+`--tcp` is the address of the gateway, expected to relay raw Modbus RTU frames. `--unit-id` is the Modbus address of the battery (1 by default.)
+`PYLONFORCE2MQTT_LOG=debug` makes it more talkative.
+
+Options:
+
+* `--poll-period` (5 seconds by default) is how often the state of the battery is read. Who the
+  battery is (its name, version and serial number) is read every 10 minutes instead.
+* `--detailed` also publishes the voltage of every cell, see below.
+* `--device-id` (`pylonforce` by default) is the ID of the bridge device, see [Devices](#devices).
+* `--unavailable-after` (60 seconds by default) is for how long the battery can go without a single
+  successful read before the stack is `disconnected`.
+
+## Devices
+
+* **`pylonforce`** is the bridge: the root device, without nodes.
+* **`pylonforce-<serial number>`** is the battery, as one device and the child of the bridge. The
+  serial number is lowercased, with each run of anything but letters and digits made into a hyphen
+  (`AB1234-56/7` gives `pylonforce-ab1234-56-7`). It is named after the manufacturer and
+  the model, e.g. `Pylon Force_H2` (`Pylontech Force H2` if the battery does not tell.)
+
+Stack is only published after the serial number has been read; the bridge can appear `ready` without
+children until then. If the serial number changes (the battery has been replaced) the bridge has the
+new stack as its only child.
+
+### Nodes and properties of the stack
+
+| Node | Property | Type | Unit | Decimals | Notes |
+|---|---|---|---|---|---|
+| `stack` | `state` | enum | | | `idle`, `charging`, `discharging` or `sleep` |
+| | `voltage` | float | V | 1 | |
+| | `current` | float | A | 2 | positive when charging |
+| | `power` | float | W | 0 | voltage times current |
+| | `state-of-charge` | integer | % | | `0:100` |
+| | `state-of-health` | integer | % | | `0:100` |
+| | `remaining-energy` | float | kWh | 3 | |
+| | `cycles` | integer | # | | |
+| | `max-temperature`, `min-temperature` | float | °C | 1 | of the modules |
+| | `max-temperature-module`, `min-temperature-module` | integer | | | the module, counted from 1 |
+| `cells` | `max-voltage`, `min-voltage` | float | V | 3 | |
+| | `voltage-spread` | float | V | 3 | highest minus lowest |
+| | `average-voltage` | float | V | 4 | made out of the voltages of the modules |
+| | `max-voltage-module`, `max-voltage-cell`, `min-voltage-module`, `min-voltage-cell` | integer | | | the module and the cell in it, counted from 1 |
+| `limits` | `charge-voltage`, `discharge-voltage` | float | V | 1 | what the BMS requests of the inverter |
+| | `charge-current`, `discharge-current` | float | A | 2 | likewise (positive, for both) |
+| | `charge-allowed`, `discharge-allowed` | boolean | | | |
+| | `force-charge-request`, `balance-charge-request` | boolean | | | |
+| `energy` | `charged-today`, `discharged-today` | float | kWh | 3 | |
+| | `charged-total`, `discharged-total` | float | kWh | 0 | see the caveats |
+| `health` | `protections`, `alarms`, `faults` | JSON | | | a sorted array of the names of the conditions, `[]` if there are none |
+| `bms` | `temperature` | float | °C | 1 | of the BMS itself, not of the cells |
+| | `firmware-version` | string | | | e.g. `2.0 (B52.34)` |
+| | `serial-number` | string | | | |
+| `module-N` | `voltage` | float | V | 2 | for each of the modules, counted from 1 |
+| | `average-cell-voltage` | float | V | 4 | the voltage of the module over the number of cells in it |
+| | `temperature` | float | °C | 1 | |
+| | `max-cell-voltage`, `min-cell-voltage` | float | V | 3 | only with `--detailed`; of the cells of the module |
+| | `max-cell-voltage-cell`, `min-cell-voltage-cell` | integer | | | only with `--detailed`; the cell in the module, counted from 1 (the first one if there are several) |
+| | `cell-voltage-spread` | float | V | 3 | only with `--detailed`; highest minus lowest of the module |
+| `module-N-cell-K` | `voltage` | float | V | 3 | only with `--detailed` |
+
+A value that is not valid (a state of charge above 100 %, a cell at 0 V, a flag that is neither 0
+nor 1 and so on) is not published: the last valid value stays. This is logged as a warning when it
+starts, and at info when the value is valid again.
+
+The number of modules and cells are read from the battery and are valid with 1 to 6 modules, 1 to
+150 cells and the same number of cells in every module. The last valid numbers are what the nodes
+are made of. If there never are any, the stack has no `module-N` nodes and no properties that need
+to know which cell is in which module (`average-voltage`, the `*-module` and `*-cell` ones.)
+
+### `--detailed`
+
+Adds the voltage of every cell as a property of a node of its own, `module-N-cell-K`, and the
+`--detailed` properties of the modules, which are made out of the voltages of the cells (not valid
+if any cell of the module is at 0 V). The battery can have 150 cells, which makes for a large
+device description, so this is off by default, and the registers with the voltages of the cells are
+not even polled without it. The temperature of the cells is never published as it is just the
+module temperature.
+
+## Caveats
+
+* Only one battery, with 4 modules of 30 cells, has been tested. Other firmware versions and
+  batteries may behave differently.
+* The total energy counters (`charged-total` and `discharged-total`) occasionally jump by huge
+  amounts. This is possibly a firmware bug. Do not trust them.
+* The temperatures have the resolution of 1 °C, even if they are published with a decimal.
+* `bms/temperature` is the temperature of the BMS itself and not of the cells. It reads high,
+  compared to them.
+* At very low currents the firmware flips the `state` back and forth between `idle` and
+  `discharging`.
+* Reads are one at a time with a pause between them, as the bus is slow. The status is read in a
+  single request so that properties derived from multiple registers are consistent.
