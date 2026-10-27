@@ -1,5 +1,7 @@
 //! A Modbus client for a single battery on a single RS485 bus: one connection, one request at a
-//! time, dropped whenever there is any doubt about what is on it. Retry pacing is up to the caller.
+//! time, dropped after any request that did not get a proper response, as there is no telling
+//! what state it (or whatever is at the other end of it) has been left in. Retry pacing is up to
+//! the caller.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -14,7 +16,7 @@ pub const MAX_COUNT: u16 = 125;
 /// How long the line has to be quiet for a late response to be considered not coming anymore.
 const QUIET: Duration = Duration::from_millis(100);
 
-/// The longest to wait for the line to become quiet before giving up on the connection.
+/// The longest to wait for the line to become quiet before dropping the connection anyway.
 const MAX_DRAIN: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -243,6 +245,7 @@ impl Client {
     }
 
     /// Read out registers. Anything but a proper response, an exception included, is an error.
+    /// The connection is opened anew for the next request after any error but an exception.
     /// Takes `&mut self` as the bus can only deal with one request at a time.
     pub async fn read(&mut self, space: Space, start: u16, count: u16) -> Result<Vec<u16>, Error> {
         if !(1..=MAX_COUNT).contains(&count) || u32::from(start) + u32::from(count) > 0x1_0000 {
@@ -263,7 +266,7 @@ impl Client {
                 reply.map_err(Error::Exception)
             }
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
-                self.resynchronize().await;
+                self.abandon().await;
                 Err(Error::Transport(e))
             }
             Ok(Err(e)) => {
@@ -271,7 +274,7 @@ impl Client {
                 Err(Error::Transport(e))
             }
             Err(_) => {
-                self.resynchronize().await;
+                self.abandon().await;
                 Err(Error::Transport(std::io::ErrorKind::TimedOut.into()))
             }
         };
@@ -279,17 +282,14 @@ impl Client {
         result
     }
 
-    /// After a request that did not go well, get to where the next response is going to be to
-    /// the next request. There is no telling where one RTU frame ends and the other begins other
+    /// Drop the connection after a request that did not go well. A transparent gateway may well
+    /// pass whatever is still coming from the bus on to the next connection, so the line is let to
+    /// become quiet first: there is no telling where one RTU frame ends and the other begins other
     /// than by waiting for silence.
-    async fn resynchronize(&mut self) {
-        let quiet = self.quiet;
-        let drained = match &mut self.connection {
-            Some(connection) => connection.drain(quiet).await,
-            None => Ok(false),
-        };
-        if !matches!(drained, Ok(true)) {
-            self.connection = None;
+    async fn abandon(&mut self) {
+        if let Some(mut connection) = self.connection.take() {
+            let _ = connection.drain(self.quiet).await;
+            debug!("dropped the connection to the battery");
         }
     }
 }
@@ -344,7 +344,8 @@ mod tests {
 
     #[tokio::test]
     async fn rtu_bad_crc_and_trailing_garbage_do_not_desynchronize() {
-        let (address, _) = fake::start(|request| match request.n {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (address, _) = fake::start_counting(accepted.clone(), |request| match request.n {
             0 => {
                 let mut frame = request.data_frame();
                 *frame.last_mut().unwrap() ^= 0x55;
@@ -367,6 +368,7 @@ mod tests {
         );
         assert_eq!(client.read(Space::Holding, 1, 1).await.unwrap(), [3001]);
         assert_eq!(client.read(Space::Holding, 2, 1).await.unwrap(), [3002]);
+        assert_eq!(accepted.load(SeqCst), 2);
     }
 
     #[tokio::test]
@@ -392,7 +394,8 @@ mod tests {
 
     #[tokio::test]
     async fn rtu_timeout_and_the_late_response_do_not_hurt_the_next_request() {
-        let (address, _) = fake::start(|request| match request.n {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (address, _) = fake::start_counting(accepted.clone(), |request| match request.n {
             0 => vec![Step::Wait(Duration::from_millis(300)), Step::Send(request.data_frame())],
             _ => fake::ok(request),
         })
@@ -402,6 +405,23 @@ mod tests {
         assert!(is_transport(client.read(Space::Holding, 5, 1).await));
         // The late response is to another register, so mistaking it for the response would show.
         assert_eq!(client.read(Space::Holding, 6, 1).await.unwrap(), [3006]);
+        assert_eq!(accepted.load(SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_is_not_answered_on_is_opened_again() {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (address, _) = fake::start_counting(accepted.clone(), |request| match request.n {
+            0 | 1 => vec![],
+            _ => fake::ok(request),
+        })
+        .await;
+        let mut client = client(address);
+        for _ in 0..2 {
+            assert!(is_transport(client.read(Space::Holding, 1, 1).await));
+        }
+        assert_eq!(client.read(Space::Holding, 1, 1).await.unwrap(), [3001]);
+        assert_eq!(accepted.load(SeqCst), 3);
     }
 
     #[tokio::test]
