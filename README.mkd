@@ -1,5 +1,10 @@
 # pylonforce2mqtt
 
+> [!NOTE]
+> This project is 100% hallucinated and carefully reviewed by yours truly, including this README!
+> The tool works on my hardware. Will it work on yours? I don't know! You are welcome to submit
+> fixes!
+
 Exposes a Pylontech Force H2 battery to MQTT following the [Homie 5
 convention](https://homieiot.github.io/). Talks to the battery's BMS over Modbus
 RTU over TCP (such as what's exposed by the logger built into the BMS).
