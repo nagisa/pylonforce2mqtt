@@ -87,7 +87,10 @@ pub(crate) type Reading = Option<Result<String, Invalid>>;
 /// every cell in it.
 pub(crate) fn poll_plan(period: Duration, detailed: bool) -> Vec<PollBlock> {
     let constant = [IDENTIFICATION, SERIAL_NUMBER].map(|block| (block, CONSTANT_PERIOD));
-    let changing = [STATUS, MODULE_VOLTAGES, MODULE_TEMPERATURES].map(|block| (block, period));
+    // A register more than there is anything at (it reads 0), only for the read to be of another
+    // length than that of the module voltages: the length is all that tells the responses apart.
+    let temperatures = Block { count: MODULE_TEMPERATURES.count + 1, ..MODULE_TEMPERATURES };
+    let changing = [STATUS, MODULE_VOLTAGES, temperatures].map(|block| (block, period));
     let cells = detailed.then_some((CELL_VOLTAGES, period));
     let blocks = constant.into_iter().chain(changing).chain(cells);
     let poll = |(Block { start, count }, period)| PollBlock {
@@ -818,7 +821,7 @@ pub(crate) mod tests {
             (Space::Holding, 0x1450, 16, constant),
             (Space::Holding, 0x1400, 58, period),
             (Space::Holding, 0x1460, 6, period),
-            (Space::Holding, 0x14B0, 6, period),
+            (Space::Holding, 0x14B0, 7, period),
         ];
         assert_eq!(plan(false), expected);
         expected.push((Space::Holding, 0x1500, 150, period));

@@ -46,6 +46,8 @@ pub enum Error {
     LookupHost(#[source] std::io::Error, String),
     #[error("polling {0} registers at {1} would go past the end of the address space")]
     BlockOutOfRange(u16, u16),
+    #[error("more than one read of {1} {0} registers: the responses could not be told apart")]
+    SameSizedReads(Space, u16),
 }
 
 #[derive(clap::Parser, Clone)]
@@ -63,7 +65,11 @@ pub struct Args {
     unit_id: u8,
 
     /// How long to wait for the battery to respond to a request.
-    #[arg(long, default_value = "1s")]
+    ///
+    /// A request that is not responded to is not given up on (and the same registers asked for
+    /// again) any sooner: RTU responses can only be told apart by their length, so there is not to
+    /// be more than one response of a length on its way at a time.
+    #[arg(long, default_value = "5s")]
     timeout: humantime::Duration,
 
     /// How long to leave the bus alone between consecutive requests.
@@ -195,6 +201,7 @@ async fn connect_tuned(
         client.quiet = quiet;
     }
     let blocks = split(blocks)?;
+    check_sizes(&blocks)?;
     info!(blocks = blocks.len(), "polling plan");
     let shared = Shared {
         snapshot: RwLock::default(),
@@ -237,6 +244,16 @@ impl std::fmt::Display for Block {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let end = u32::from(self.start) + u32::from(self.count) - 1;
         write!(f, "{} registers {}..={end}", self.space, self.start)
+    }
+}
+
+/// Every read has to be of a different number of registers (or of the other space), as that is
+/// the only way to tell which request a response is to. See [`client::Late`].
+fn check_sizes(blocks: &[Block]) -> Result<(), Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    match blocks.iter().find(|block| !seen.insert((block.space, block.count))) {
+        Some(block) => Err(Error::SameSizedReads(block.space, block.count)),
+        None => Ok(()),
     }
 }
 
@@ -305,6 +322,32 @@ impl Worker {
             }
         };
         self.finish(index, started, result);
+        let now = Instant::now();
+        for (space, words) in self.client.take_late() {
+            let count = words.len();
+            match self.blocks.iter().find(|b| b.space == space && usize::from(b.count) == count) {
+                Some(block) => self.store(space, block.start, &words, now),
+                None => debug!(%space, count, "a late response that is to none of the blocks"),
+            }
+        }
+    }
+
+    /// Put what has been read into the snapshot, and let it be known if that changes anything.
+    fn store(&self, space: Space, start: u16, words: &[u16], now: Instant) {
+        let mut snapshot = self.shared.write();
+        let mut stored = false;
+        for (i, &word) in words.iter().enumerate() {
+            stored |= snapshot.set(space, start + i as u16, word);
+        }
+        let available = snapshot.record_success(now);
+        drop(snapshot);
+        if available {
+            info!("the battery is available");
+        }
+        if stored || available {
+            debug!(%space, start, available, "registers changed");
+            self.shared.changed.notify_one();
+        }
     }
 
     fn finish(&mut self, index: usize, started: Instant, result: Result<Vec<u16>, RequestError>) {
@@ -322,21 +365,9 @@ impl Worker {
                     Status::Failing(_) => info!(%block, "the registers can be read out again"),
                 }
                 block.status = Status::Ok;
+                debug!(%block, took = ?started.elapsed(), "read out");
                 let (space, start) = (block.space, block.start);
-                let mut snapshot = self.shared.write();
-                let mut stored = false;
-                for (i, &word) in words.iter().enumerate() {
-                    stored |= snapshot.set(space, start + i as u16, word);
-                }
-                let available = snapshot.record_success(now);
-                drop(snapshot);
-                if available {
-                    info!("the battery is available");
-                }
-                if stored || available {
-                    debug!(%space, start, took = ?started.elapsed(), available, "registers changed");
-                    self.shared.changed.notify_one();
-                }
+                self.store(space, start, &words, now);
             }
             // The battery responded properly. It just does not have what is asked for.
             Err(RequestError::Exception(ExceptionCode::ILLEGAL_DATA_ADDRESS)) => {
@@ -432,6 +463,40 @@ mod tests {
         let delays: Vec<_> = (0..8).map(|n| Backoff::DEFAULT.delay(n).as_secs()).collect();
         assert_eq!(delays, [0, 0, 1, 2, 4, 8, 10, 10]);
         assert_eq!(Backoff::DEFAULT.delay(u32::MAX), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn reads_of_the_same_size_are_refused() {
+        let same = split(vec![block(Space::Holding, 1, 6), block(Space::Holding, 100, 6)]);
+        assert!(matches!(check_sizes(&same.unwrap()), Err(Error::SameSizedReads(_, 6))));
+        let other_space = split(vec![block(Space::Holding, 1, 6), block(Space::Input, 100, 6)]);
+        assert!(check_sizes(&other_space.unwrap()).is_ok());
+        let parts = split(vec![block(Space::Input, 100, 300)]).unwrap();
+        assert!(matches!(check_sizes(&parts), Err(Error::SameSizedReads(_, 125))));
+    }
+
+    #[tokio::test]
+    async fn a_late_response_goes_to_the_block_of_its_length() {
+        // The block at 100 is never responded to in time, but its response turns up with that of
+        // the other one.
+        let (address, _server) = fake::start(|request| match request.start {
+            100 => vec![],
+            _ => {
+                let late = Req { start: 100, count: 3, ..request.clone() }.data_frame();
+                [Step::Send(late)].into_iter().chain(fake::ok(request)).collect()
+            }
+        })
+        .await;
+        let blocks = vec![block(Space::Holding, 1, 2), block(Space::Holding, 100, 3)];
+        let device = connect_tuned(&args(address, "60s"), blocks, tuning()).await.unwrap();
+        while device.handle.snapshot().words(Space::Holding, 100, 3).is_none() {
+            assert!(changed_within(&device.handle, 2000).await);
+        }
+        let snapshot = device.handle.snapshot();
+        assert_eq!(snapshot.words(Space::Holding, 100, 3), Some(vec![3100, 3101, 3102]));
+        assert_eq!(snapshot.words(Space::Holding, 1, 2), Some(vec![3001, 3002]));
+        drop(snapshot);
+        device.task.abort();
     }
 
     #[tokio::test]

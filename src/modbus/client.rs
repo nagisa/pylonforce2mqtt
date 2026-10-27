@@ -34,6 +34,14 @@ impl Space {
             Space::Input => 4,
         }
     }
+
+    const fn of_function(function: u8) -> Option<Space> {
+        match function {
+            3 => Some(Space::Holding),
+            4 => Some(Space::Input),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Space {
@@ -95,6 +103,15 @@ fn invalid(message: impl Into<String>) -> std::io::Error {
 
 type Reply = Result<Vec<u16>, ExceptionCode>;
 
+fn words(data: &[u8]) -> Vec<u16> {
+    data.chunks_exact(2).map(|w| u16::from_be_bytes([w[0], w[1]])).collect()
+}
+
+/// A proper response to an earlier request than the one it has arrived after: the words read out
+/// of this space. RTU has nothing like a transaction ID, so the number of the words is all there is
+/// to tell which of the requests it was.
+pub type Late = (Space, Vec<u16>);
+
 /// Make sense of the PDU of a response (function code and what follows.)
 fn parse_pdu(pdu: &[u8], function: u8, count: u16) -> std::io::Result<Reply> {
     match pdu {
@@ -104,7 +121,7 @@ fn parse_pdu(pdu: &[u8], function: u8, count: u16) -> std::io::Result<Reply> {
                 && usize::from(*bytes) == 2 * usize::from(count)
                 && data.len() == usize::from(*bytes) =>
         {
-            Ok(Ok(data.chunks_exact(2).map(|w| u16::from_be_bytes([w[0], w[1]])).collect()))
+            Ok(Ok(words(data)))
         }
         _ => Err(invalid(format!("unexpected response PDU {pdu:02x?}"))),
     }
@@ -145,14 +162,16 @@ impl Connection {
         Ok(false)
     }
 
-    /// Send a request and wait for the response. `InvalidData` means that something has arrived
-    /// that is not what was asked for. Not cancellation safe: drain or drop the connection after.
+    /// Send a request and wait for the response, putting what responds to earlier requests in
+    /// `late`. `InvalidData` means that something has arrived that is not a proper response. Not
+    /// cancellation safe: drain or drop the connection after.
     async fn exchange(
         &mut self,
         unit_id: u8,
         function: u8,
         start: u16,
         count: u16,
+        late: &mut Vec<Late>,
     ) -> std::io::Result<Reply> {
         self.discard_stale()?;
         let mut frame = Vec::with_capacity(8);
@@ -161,33 +180,50 @@ impl Connection {
         frame.extend(count.to_be_bytes());
         frame.extend(crc16(&frame).to_le_bytes());
         self.stream.write_all(&frame).await?;
-        self.read_rtu(unit_id, function, count).await
+        self.read_rtu(unit_id, function, count, late).await
     }
 
-    async fn read_rtu(&mut self, unit_id: u8, function: u8, count: u16) -> std::io::Result<Reply> {
-        // The first three bytes tell how long the rest is, so a made up length never makes us read
-        // more than the protocol allows.
+    /// Read frames until the response to the request. A proper response to a read of some other
+    /// number of registers, or of the other space, is one to an earlier request that has arrived
+    /// late (the gateway passes on what comes from the bus to whichever connection it has at the
+    /// time.) It goes to `late`.
+    async fn read_rtu(
+        &mut self,
+        unit_id: u8,
+        function: u8,
+        count: u16,
+        late: &mut Vec<Late>,
+    ) -> std::io::Result<Reply> {
         let mut buffer = [0u8; 256];
-        self.stream.read_exact(&mut buffer[..3]).await?;
-        if buffer[0] != unit_id {
-            return Err(invalid(format!("response from unit {}, not {unit_id}", buffer[0])));
+        loop {
+            // The first three bytes tell how long the rest is, so a made up length never makes us
+            // read more than the protocol allows.
+            self.stream.read_exact(&mut buffer[..3]).await?;
+            if buffer[0] != unit_id {
+                return Err(invalid(format!("response from unit {}, not {unit_id}", buffer[0])));
+            }
+            let bytes = usize::from(buffer[2]);
+            let total = if buffer[1] == function | 0x80 {
+                5
+            } else if Space::of_function(buffer[1]).is_none() {
+                return Err(invalid(format!("response with function code {}", buffer[1])));
+            } else if bytes == 0 || bytes % 2 != 0 || bytes > 2 * usize::from(MAX_COUNT) {
+                return Err(invalid(format!("{bytes} bytes in response to a read")));
+            } else {
+                3 + bytes + 2
+            };
+            self.stream.read_exact(&mut buffer[3..total]).await?;
+            let (body, crc) = buffer[..total].split_at(total - 2);
+            if crc16(body) != u16::from_le_bytes([crc[0], crc[1]]) {
+                return Err(invalid(format!("response with a bad CRC {:02x?}", &buffer[..total])));
+            }
+            if total == 5 || (buffer[1] == function && bytes == 2 * usize::from(count)) {
+                return parse_pdu(&body[1..], function, count);
+            }
+            let space = Space::of_function(buffer[1]).expect("checked above");
+            debug!(%space, count = bytes / 2, "received a response to an earlier request");
+            late.push((space, words(&body[3..])));
         }
-        let total = if buffer[1] == function | 0x80 {
-            5
-        } else if buffer[1] != function {
-            return Err(invalid(format!("response with function code {}", buffer[1])));
-        } else if usize::from(buffer[2]) != 2 * usize::from(count) {
-            let bytes = buffer[2];
-            return Err(invalid(format!("{bytes} bytes in response to a read of {count}")));
-        } else {
-            3 + usize::from(buffer[2]) + 2
-        };
-        self.stream.read_exact(&mut buffer[3..total]).await?;
-        let (body, crc) = buffer[..total].split_at(total - 2);
-        if crc16(body) != u16::from_le_bytes([crc[0], crc[1]]) {
-            return Err(invalid(format!("response with a bad CRC {:02x?}", &buffer[..total])));
-        }
-        parse_pdu(&body[1..], function, count)
     }
 }
 
@@ -217,14 +253,15 @@ pub struct Client {
     request_gap: Duration,
     connection: Option<Connection>,
     last_exchange: Option<Instant>,
+    late: Vec<Late>,
     pub(crate) quiet: Duration,
 }
 
 impl Client {
     /// Connects on the first request. `tcp` is as in [`resolve`].
     pub fn new(tcp: String, unit_id: u8, timeout: Duration, request_gap: Duration) -> Client {
-        let (connection, last_exchange, quiet) = (None, None, QUIET);
-        Client { tcp, unit_id, timeout, request_gap, connection, last_exchange, quiet }
+        let (connection, last_exchange, late, quiet) = (None, None, Vec::new(), QUIET);
+        Client { tcp, unit_id, timeout, request_gap, connection, last_exchange, late, quiet }
     }
 
     async fn connect(&mut self) -> std::io::Result<()> {
@@ -259,7 +296,8 @@ impl Client {
         self.connect().await.map_err(Error::Transport)?;
         let started = Instant::now();
         let connection = self.connection.as_mut().expect("connected above");
-        let exchange = connection.exchange(self.unit_id, space.function(), start, count);
+        let late = &mut self.late;
+        let exchange = connection.exchange(self.unit_id, space.function(), start, count, late);
         let result = match tokio::time::timeout(self.timeout, exchange).await {
             Ok(Ok(reply)) => {
                 debug!(%space, start, count, elapsed = ?started.elapsed(), "request completed");
@@ -282,6 +320,12 @@ impl Client {
         result
     }
 
+    /// The responses to earlier requests that have arrived since this was last called. They are
+    /// as good as any other response, and may well have arrived with a request that has failed.
+    pub fn take_late(&mut self) -> Vec<Late> {
+        std::mem::take(&mut self.late)
+    }
+
     /// Drop the connection after a request that did not go well. A transparent gateway may well
     /// pass whatever is still coming from the bus on to the next connection, so the line is let to
     /// become quiet first: there is no telling where one RTU frame ends and the other begins other
@@ -297,7 +341,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modbus::fake::{self, Step};
+    use crate::modbus::fake::{self, Req, Step};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
@@ -376,7 +420,7 @@ mod tests {
         let (address, _) = fake::start(|request| {
             let frame = match request.n {
                 0 => request.frame_from(2, &[3, 2, 0, 7]), // another unit
-                1 => request.frame_from(1, &[3, 4, 0, 7, 0, 8]), // the wrong number of bytes
+                1 => request.frame_from(1, &[3, 3, 0, 7, 0]), // an odd number of bytes
                 2 => request.frame_from(1, &[4, 2, 0, 7]), // the wrong function code
                 3 => vec![1, 3, 0xFF, 0, 0, 0, 0],         // a huge byte count
                 4 => request.data_frame()[..4].to_vec(),   // cut short
@@ -406,6 +450,31 @@ mod tests {
         // The late response is to another register, so mistaking it for the response would show.
         assert_eq!(client.read(Space::Holding, 6, 1).await.unwrap(), [3006]);
         assert_eq!(accepted.load(SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn late_responses_to_other_reads_are_kept_for_the_caller() {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (address, _) = fake::start_counting(accepted.clone(), |request| match request.n {
+            0 => {
+                let late = Req { count: 58, ..request.clone() }.data_frame();
+                let other_space = Req { function: 4, count: 2, ..request.clone() }.data_frame();
+                let pause = Step::Wait(Duration::from_millis(15));
+                let late = [Step::Send(late), pause, Step::Send(other_space)];
+                late.into_iter().chain(fake::ok(request)).collect()
+            }
+            _ => fake::ok(request),
+        })
+        .await;
+        let mut client = client(address);
+        assert_eq!(client.read(Space::Holding, 5216, 6).await.unwrap().len(), 6);
+        let late = client.take_late();
+        let late: Vec<_> =
+            late.iter().map(|(space, words)| (*space, words[..2].to_vec())).collect();
+        assert_eq!(late, [(Space::Holding, vec![8216, 8217]), (Space::Input, vec![9216, 9217])]);
+        assert!(client.take_late().is_empty());
+        assert_eq!(client.read(Space::Holding, 5296, 1).await.unwrap(), [8296]);
+        assert_eq!(accepted.load(SeqCst), 1);
     }
 
     #[tokio::test]

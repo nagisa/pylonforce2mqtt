@@ -601,7 +601,7 @@ mod tests {
         let blocks = |extra: &[&str]| {
             poll_plan(&args(extra)).iter().map(|b| (b.start, b.count)).collect::<Vec<_>>()
         };
-        let mut expected = vec![(0x1000, 12), (0x1450, 16), (0x1400, 58), (0x1460, 6), (0x14B0, 6)];
+        let mut expected = vec![(0x1000, 12), (0x1450, 16), (0x1400, 58), (0x1460, 6), (0x14B0, 7)];
         assert_eq!(blocks(&[]), expected);
         expected.push((0x1500, 150));
         assert_eq!(blocks(&["--detailed"]), expected);
