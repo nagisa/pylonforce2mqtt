@@ -10,6 +10,7 @@ mod snapshot;
 pub use client::{Client, Error as RequestError, ExceptionCode, MAX_COUNT, Space};
 pub use snapshot::Snapshot;
 
+use crate::Chain;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -380,7 +381,7 @@ impl Worker {
             }
             Err(e) => {
                 if !matches!(was, Status::Failing(_)) {
-                    warn!(error = (&e as &dyn std::error::Error), %block, "could not read out the registers");
+                    warn!(error = %Chain(&e), %block, "could not read out the registers");
                 }
                 block.status = Status::Failing(match (&e, was) {
                     // The battery has said its piece, and will say the same if asked at once.
