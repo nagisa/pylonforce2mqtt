@@ -8,6 +8,8 @@
         package = pkgs: pkgs.rustPlatform.buildRustPackage {
             inherit (cargoToml.package) name version;
             src = ./.;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.aws-lc ];
             cargoLock.lockFile = ./Cargo.lock;
             doCheck = false;
         };
